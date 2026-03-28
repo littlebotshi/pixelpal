@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pixelpal"
+version = "0.1.0"
+description = "MCP server for Android phone control — uses droidrun's device I/O without its LLM layer"
+requires-python = ">=3.11"
+license = "MIT"
+dependencies = [
+    "droidrun>=0.5.0",
+    "mcp>=1.0.0",
+]
+
+[project.scripts]
+pixelpal = "server:main"
