@@ -317,7 +317,10 @@ mcp = FastMCP(
         "Prefer screenshot_small over screenshot to save context window space. "
         "IMPORTANT: Do NOT call nonexistent tools. The correct tool names are: "
         "tap_xy (NOT 'tap'), press_button (NOT 'press_key'), start_app (NOT 'launch_app'). "
-        "All text parameters must be strings, not numbers (use '98122' not 98122)."
+        "All text parameters must be strings, not numbers (use '98122' not 98122). "
+        "For start_app/stop_app/launch_app, use 'package' not 'package_name' — "
+        "though both are accepted. "
+        "To switch apps stuck in foreground: press_button('home') first, then stop_app, then start_app."
     ),
     lifespan=device_lifespan,
 )
@@ -762,13 +765,23 @@ async def get_apps(include_system: bool = False, ctx: Context = None) -> str:
 
 
 @mcp.tool()
-async def start_app(package: str, ctx: Context = None) -> str:
+async def start_app(
+    package: str, ctx: Context = None, package_name: Optional[str] = None
+) -> str:
     """Launch an app by its package name.
 
     Call get_apps first to find the package name of the app you want.
     Example: start_app("com.google.android.apps.maps")
     Automatically returns the updated UI tree after launching.
+
+    Args:
+        package: The app package name (e.g. "com.facebook.katana").
+        package_name: Alias for package — accepted to handle common model mistakes.
     """
+    # Accept package_name as fallback if package was not provided
+    package = str(package or package_name or "").strip()
+    if not package:
+        return "Error: provide a package name, e.g. start_app('com.facebook.katana')"
     state = await _ensure_connected(ctx)
     result = await state.driver.start_app(package)
     await asyncio.sleep(2.0)  # apps take longer to launch
@@ -778,17 +791,31 @@ async def start_app(package: str, ctx: Context = None) -> str:
 
 # Alias: models often hallucinate "launch_app" instead of "start_app"
 @mcp.tool()
-async def launch_app(package: str, ctx: Context = None) -> str:
+async def launch_app(
+    package: str, ctx: Context = None, package_name: Optional[str] = None
+) -> str:
     """Alias for start_app. Launch an app by its package name."""
-    return await start_app(package, ctx)
+    return await start_app(package, ctx, package_name)
 
 
 @mcp.tool()
-async def stop_app(package: str, ctx: Context = None) -> str:
+async def stop_app(
+    package: str, ctx: Context = None, package_name: Optional[str] = None
+) -> str:
     """Force stop an app by its package name.
 
-    Useful for restarting a misbehaving app. Call start_app afterwards to relaunch.
+    Useful for clearing a stuck foreground app before launching another.
+    Tip: call press_button('home') first to dismiss any full-screen overlay,
+    then stop_app, then start_app for the new app.
+
+    Args:
+        package: The app package name (e.g. "com.starbucks.mobilecard").
+        package_name: Alias for package — accepted to handle common model mistakes.
     """
+    # Accept package_name as fallback if package was not provided
+    package = str(package or package_name or "").strip()
+    if not package:
+        return "Error: provide a package name, e.g. stop_app('com.starbucks.mobilecard')"
     state = await _ensure_connected(ctx)
     await state.driver.device.shell(f"am force-stop {package}")
     await asyncio.sleep(0.5)
