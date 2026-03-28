@@ -14,6 +14,7 @@ Usage:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -33,6 +34,9 @@ from droidrun.tools.ui.provider import AndroidStateProvider
 from droidrun.tools.ui.state import UIState
 
 logger = logging.getLogger(__name__)
+
+# Default settle time (seconds) after actions before refreshing UI
+_SETTLE_DELAY = 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -87,6 +91,15 @@ class DeviceState:
         assert self._provider is not None, "Not connected — call connect() first"
         return self._provider
 
+    async def refresh_ui(self) -> str:
+        """Fetch the current UI tree and cache it. Returns formatted text."""
+        ui = await self.state_provider.get_state()
+        self.ui = ui
+        result = ui.formatted_text
+        if ui.phone_state:
+            result += f"\n\nPhone state: {json.dumps(ui.phone_state)}"
+        return result
+
     async def shutdown(self) -> None:
         if self._driver and self._driver.device:
             try:
@@ -117,6 +130,8 @@ mcp = FastMCP(
         "Control an Android phone via PixelPal. "
         "Call get_ui to see what's on screen (returns an indexed accessibility tree), "
         "then use tap_element with the element index to interact. "
+        "Most action tools (tap_element, scroll, press_button, etc.) return the "
+        "updated UI automatically, so you rarely need to call get_ui separately. "
         "Use screenshot only when you need to visually inspect the screen."
     ),
     lifespan=device_lifespan,
@@ -150,13 +165,7 @@ async def get_ui(ctx: Context) -> str:
     Also returns phone state (current app, keyboard visibility, etc.).
     """
     state = await _ensure_connected(ctx)
-    ui = await state.state_provider.get_state()
-    state.ui = ui
-
-    result = ui.formatted_text
-    if ui.phone_state:
-        result += f"\n\nPhone state: {json.dumps(ui.phone_state)}"
-    return result
+    return await state.refresh_ui()
 
 
 @mcp.tool()
@@ -165,43 +174,89 @@ async def tap_element(index: int, ctx: Context) -> str:
 
     Call get_ui first to see available elements and their indices.
     The tap will land at the centre of the element's bounds.
+    Automatically returns the updated UI tree after tapping.
     """
     state = await _ensure_connected(ctx)
     if state.ui is None:
         return "Error: call get_ui first to load the UI tree."
     try:
         x, y = state.ui.get_element_coords(index)
-        await state.driver.tap(x, y)
         info = state.ui.get_element_info(index)
         text = info.get("text", "")
-        cls = info.get("className", "")
-        return f"Tapped element {index} ({cls}: '{text}') at ({x}, {y})"
+        await state.driver.tap(x, y)
+        await asyncio.sleep(_SETTLE_DELAY)
+        ui_text = await state.refresh_ui()
+        return f"Tapped '{text}' at ({x}, {y})\n\n{ui_text}"
     except (ValueError, IndexError) as e:
         return f"Error: {e}"
 
 
 @mcp.tool()
 async def tap_xy(x: int, y: int, ctx: Context) -> str:
-    """Tap at exact screen coordinates (pixels)."""
+    """Tap at exact screen coordinates (pixels).
+    Automatically returns the updated UI tree after tapping.
+    """
     state = await _ensure_connected(ctx)
     await state.driver.tap(x, y)
-    return f"Tapped ({x}, {y})"
+    await asyncio.sleep(_SETTLE_DELAY)
+    ui_text = await state.refresh_ui()
+    return f"Tapped ({x}, {y})\n\n{ui_text}"
+
+
+@mcp.tool()
+async def scroll(
+    direction: str, amount: int = 3, ctx: Context = None
+) -> str:
+    """Scroll the screen in a direction. Much simpler than raw swipe.
+
+    Args:
+        direction: "up", "down", "left", or "right"
+        amount: 1-5 (small to large scroll distance). Default 3.
+
+    Automatically returns the updated UI tree after scrolling.
+    """
+    state = await _ensure_connected(ctx)
+
+    # Use screen dimensions from last UI fetch, or defaults for common phones
+    w = state.ui.screen_width if state.ui else 1080
+    h = state.ui.screen_height if state.ui else 2400
+
+    cx, cy = w // 2, h // 2
+    # Scale distance: amount 1 = 20% of screen, amount 5 = 60%
+    frac = 0.12 + (amount * 0.10)
+    dist_x = int(w * frac)
+    dist_y = int(h * frac)
+
+    swipes = {
+        "down": (cx, cy + dist_y // 2, cx, cy - dist_y // 2),
+        "up": (cx, cy - dist_y // 2, cx, cy + dist_y // 2),
+        "left": (cx + dist_x // 2, cy, cx - dist_x // 2, cy),
+        "right": (cx - dist_x // 2, cy, cx + dist_x // 2, cy),
+    }
+    direction = direction.lower()
+    if direction not in swipes:
+        return f"Error: direction must be up/down/left/right, got '{direction}'"
+
+    x1, y1, x2, y2 = swipes[direction]
+    await state.driver.swipe(x1, y1, x2, y2, duration_ms=800)
+    await asyncio.sleep(_SETTLE_DELAY)
+    ui_text = await state.refresh_ui()
+    return f"Scrolled {direction} (amount={amount})\n\n{ui_text}"
 
 
 @mcp.tool()
 async def swipe(
     x1: int, y1: int, x2: int, y2: int, duration_ms: int = 1000, ctx: Context = None
 ) -> str:
-    """Swipe from (x1, y1) to (x2, y2).
+    """Swipe from (x1, y1) to (x2, y2) for precise control.
 
-    Common patterns:
-    - Scroll down: swipe(540, 1500, 540, 500)
-    - Scroll up: swipe(540, 500, 540, 1500)
-    - Swipe left: swipe(900, 1200, 100, 1200)
+    For simple scrolling, prefer the scroll() tool instead.
     """
     state = await _ensure_connected(ctx)
     await state.driver.swipe(x1, y1, x2, y2, duration_ms=duration_ms)
-    return f"Swiped ({x1},{y1}) -> ({x2},{y2}) over {duration_ms}ms"
+    await asyncio.sleep(_SETTLE_DELAY)
+    ui_text = await state.refresh_ui()
+    return f"Swiped ({x1},{y1}) -> ({x2},{y2})\n\n{ui_text}"
 
 
 @mcp.tool()
@@ -210,12 +265,16 @@ async def input_text(text: str, clear: bool = False, ctx: Context = None) -> str
 
     Use tap_element to focus an input field first, then call this.
     Set clear=True to clear existing text before typing.
+    Automatically returns the updated UI tree after typing.
     """
     state = await _ensure_connected(ctx)
     success = await state.driver.input_text(text, clear)
-    if success:
-        return f"Typed: '{text}'" + (" (cleared first)" if clear else "")
-    return "Error: failed to type text. Is an input field focused?"
+    if not success:
+        return "Error: failed to type text. Is an input field focused?"
+    await asyncio.sleep(_SETTLE_DELAY)
+    ui_text = await state.refresh_ui()
+    label = f"Typed: '{text}'" + (" (cleared first)" if clear else "")
+    return f"{label}\n\n{ui_text}"
 
 
 @mcp.tool()
@@ -223,13 +282,16 @@ async def press_button(button: str, ctx: Context = None) -> str:
     """Press a system button.
 
     Supported buttons: back, home, enter
+    Automatically returns the updated UI tree after pressing.
     """
     button = button.lower()
     if button not in ("back", "home", "enter"):
         return f"Error: unknown button '{button}'. Use: back, home, enter"
     state = await _ensure_connected(ctx)
     await state.driver.press_button(button)
-    return f"Pressed {button}"
+    await asyncio.sleep(_SETTLE_DELAY)
+    ui_text = await state.refresh_ui()
+    return f"Pressed {button}\n\n{ui_text}"
 
 
 @mcp.tool()
@@ -262,10 +324,13 @@ async def start_app(package: str, ctx: Context = None) -> str:
 
     Call get_apps first to find the package name of the app you want.
     Example: start_app("com.google.android.apps.maps")
+    Automatically returns the updated UI tree after launching.
     """
     state = await _ensure_connected(ctx)
     result = await state.driver.start_app(package)
-    return result or f"Started {package}"
+    await asyncio.sleep(2.0)  # apps take longer to launch
+    ui_text = await state.refresh_ui()
+    return f"{result or f'Started {package}'}\n\n{ui_text}"
 
 
 @mcp.tool()
@@ -282,6 +347,22 @@ async def get_element_info(index: int, ctx: Context = None) -> str:
     if not info:
         return f"Error: no element found with index {index}"
     return json.dumps(info, indent=2)
+
+
+@mcp.tool()
+async def drag(
+    x1: int, y1: int, x2: int, y2: int, duration_s: float = 3.0, ctx: Context = None
+) -> str:
+    """Drag from (x1, y1) to (x2, y2). Useful for sliders, drag-and-drop, etc.
+
+    Slower than swipe by default (3s) to ensure the drag registers.
+    Automatically returns the updated UI tree after dragging.
+    """
+    state = await _ensure_connected(ctx)
+    await state.driver.drag(x1, y1, x2, y2, duration=duration_s)
+    await asyncio.sleep(_SETTLE_DELAY)
+    ui_text = await state.refresh_ui()
+    return f"Dragged ({x1},{y1}) -> ({x2},{y2}) over {duration_s}s\n\n{ui_text}"
 
 
 # ---------------------------------------------------------------------------
