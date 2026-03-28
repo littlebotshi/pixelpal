@@ -139,6 +139,52 @@ def _count_app_elements(ui: UIState) -> int:
     return count
 
 
+# ---------------------------------------------------------------------------
+# Danger gate — blocks irreversible payment/order taps without explicit opt-in
+# ---------------------------------------------------------------------------
+
+# Patterns that indicate a payment or irreversible order confirmation.
+# Matched case-insensitively against element text and contentDescription.
+_DANGER_PATTERNS: list[re.Pattern] = [
+    re.compile(p, re.IGNORECASE)
+    for p in [
+        r"^place order$",
+        r"^place my order$",
+        r"^confirm order$",
+        r"^confirm and pay",
+        r"^confirm purchase$",
+        r"^complete order$",
+        r"^complete purchase$",
+        r"^submit order$",
+        r"^pay now$",
+        r"^pay \$",          # "Pay $12.50"
+        r"^buy now$",
+        r"^purchase$",
+        r"^checkout$",
+        r"^check out$",
+        r"^order now$",
+        r"^yes,? place",     # "Yes, place my order"
+        r"^subscribe and pay",
+        r"^start (free )?trial",
+    ]
+]
+
+
+def _is_dangerous(text: str) -> bool:
+    """Return True if the element text matches a payment/order danger pattern."""
+    t = (text or "").strip()
+    return any(p.search(t) for p in _DANGER_PATTERNS)
+
+
+def _danger_block_message(element_text: str) -> str:
+    return (
+        f"🚫 BLOCKED — '{element_text}' is a payment/order confirmation button.\n"
+        f"This action is irreversible. You MUST ask the user for explicit approval "
+        f"before proceeding.\n"
+        f"Once the user confirms, re-call this tool with confirmed=True to execute."
+    )
+
+
 def _resize_png_safe(png_bytes: bytes, max_dim: int) -> Tuple[bytes, str]:
     """Resize a PNG to JPEG. Returns (bytes, format).
 
@@ -323,7 +369,10 @@ mcp = FastMCP(
         "To switch apps stuck in foreground: press_button('home') first, then stop_app, then start_app. "
         "In messaging apps (Messenger, WhatsApp, iMessage), Enter does NOT send — "
         "use input_text() then send_current_input() to send messages. "
-        "ALWAYS verify writes (sent messages, submitted forms) via get_ui before declaring success."
+        "ALWAYS verify writes (sent messages, submitted forms) via get_ui before declaring success. "
+        "PAYMENT GATE: tap_element, find_and_tap, and tap_xy will BLOCK any tap on a payment or "
+        "order confirmation button (Place Order, Pay Now, Confirm Purchase, etc.) and return an error. "
+        "You MUST ask the user for approval first, then re-call with confirmed=True."
     ),
     lifespan=device_lifespan,
 )
@@ -374,7 +423,12 @@ async def get_ui(ctx: Context) -> str:
 
 
 @mcp.tool()
-async def tap_element(index: int, ctx: Context, use_clear_point: bool = False) -> str:
+async def tap_element(
+    index: int,
+    ctx: Context,
+    use_clear_point: bool = False,
+    confirmed: bool = False,
+) -> str:
     """Tap a UI element by its index from the get_ui output.
 
     Call get_ui first to see available elements and their indices.
@@ -384,9 +438,12 @@ async def tap_element(index: int, ctx: Context, use_clear_point: bool = False) -
         index: Element index from get_ui output.
         use_clear_point: If True, find a tap point that avoids overlapping
             elements (useful for crowded UIs like lists with favorite buttons).
+        confirmed: Must be True to tap payment/order confirmation buttons
+            (e.g. "Place Order", "Pay Now", "Confirm Purchase"). The server
+            blocks these automatically — only pass confirmed=True after the
+            user has explicitly approved the action.
     """
     state = await _ensure_connected(ctx)
-    # Auto-refresh UI if cache is empty (fixes "call get_ui first" errors)
     await state.ensure_ui()
     try:
         if use_clear_point:
@@ -395,6 +452,11 @@ async def tap_element(index: int, ctx: Context, use_clear_point: bool = False) -
             x, y = state.ui.get_element_coords(index)
         info = state.ui.get_element_info(index)
         text = info.get("text", "")
+
+        # Danger gate: block payment/order confirmations without explicit opt-in
+        if _is_dangerous(text) and not confirmed:
+            return _danger_block_message(text)
+
         await state.driver.tap(x, y)
         await state.smart_settle()
         ui_text = await state.refresh_ui_compact()
@@ -404,11 +466,33 @@ async def tap_element(index: int, ctx: Context, use_clear_point: bool = False) -
 
 
 @mcp.tool()
-async def tap_xy(x: int, y: int, ctx: Context) -> str:
+async def tap_xy(
+    x: int, y: int, ctx: Context, confirmed: bool = False
+) -> str:
     """Tap at exact screen coordinates (pixels).
     Automatically returns the updated UI tree after tapping.
+
+    Args:
+        confirmed: Must be True if the coordinates correspond to a payment or
+            order confirmation button. The server will warn you if it detects
+            a danger element near these coordinates.
     """
     state = await _ensure_connected(ctx)
+
+    # Soft danger check: look for danger elements near these coordinates
+    if state.ui and not confirmed:
+        all_elems = UIState._collect_all(state.ui.elements)
+        for elem in all_elems:
+            center = _elem_center(elem)
+            if center is None:
+                continue
+            ex, ey = center
+            # Within 100px of tap point
+            if abs(ex - x) < 100 and abs(ey - y) < 100:
+                text = elem.get("text", "")
+                if _is_dangerous(text):
+                    return _danger_block_message(text)
+
     await state.driver.tap(x, y)
     await state.smart_settle()
     ui_text = await state.refresh_ui_compact()
@@ -471,7 +555,7 @@ async def long_press_element(
 
 @mcp.tool()
 async def find_and_tap(
-    text: str, ctx: Context, occurrence: int = 1
+    text: str, ctx: Context, occurrence: int = 1, confirmed: bool = False
 ) -> str:
     """Find a UI element by its text content and tap it.
 
@@ -482,17 +566,17 @@ async def find_and_tap(
     Args:
         text: Text to search for (case-insensitive substring match).
         occurrence: Which match to tap if multiple found (1 = first, 2 = second, etc.).
+        confirmed: Must be True to tap payment/order confirmation buttons
+            (e.g. "Place Order", "Pay Now"). Only pass after user approval.
     """
     # Type coercion: models often pass int instead of str
     text = str(text)
 
     state = await _ensure_connected(ctx)
-    # Refresh UI to get latest state
     await state.refresh_ui()
     if state.ui is None:
         return "Error: could not fetch UI tree."
 
-    # Search the cached UIState elements (not the raw tree!)
     pattern = re.compile(re.escape(text), re.IGNORECASE)
     matches = _search_elements(state.ui.elements, pattern)
 
@@ -508,8 +592,13 @@ async def find_and_tap(
     if center is None:
         return f"Found '{text}' but element has no bounds."
 
-    x, y = center
     matched_text = target.get("text", text)
+
+    # Danger gate: block payment/order confirmations without explicit opt-in
+    if _is_dangerous(matched_text) and not confirmed:
+        return _danger_block_message(matched_text)
+
+    x, y = center
     await state.driver.tap(x, y)
     await state.smart_settle()
     ui_text = await state.refresh_ui_compact()
