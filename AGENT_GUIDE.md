@@ -125,11 +125,13 @@ The screenshot appears as an image alongside the text. Use it to visually read t
 |------|---------|
 | `tap_element(index)` | Tap by element index |
 | `tap_xy(x, y)` | Tap by coordinates |
+| `tap(x, y)` | Alias for `tap_xy` |
 | `find_and_tap("text")` | Find element by text and tap it |
 | `long_press(x, y)` | Long press at coordinates |
 | `long_press_element(index)` | Long press by element index |
 | `input_text("text")` | Type into focused input |
 | `press_button("back")` | System button (back/home/enter) |
+| `press_key("back")` | Alias for `press_button` |
 
 ### Navigation
 | Tool | Purpose |
@@ -140,6 +142,8 @@ The screenshot appears as an image alongside the text. Use it to visually read t
 | `swipe(x1, y1, x2, y2)` | Raw swipe for precise control |
 | `drag(x1, y1, x2, y2)` | Slow drag for sliders |
 | `start_app("com.package.name")` | Launch an app |
+| `launch_app("com.package.name")` | Alias for `start_app` |
+| `stop_app("com.package.name")` | Force stop an app |
 | `open_url("https://...")` | Open URL or deep link |
 
 ### Waiting
@@ -224,3 +228,67 @@ press_button("back")   # dismiss the popup
 - Action tools return compact output by default — only call `get_ui` when you need full element details
 - Use `find_and_tap` to combine two steps (get_ui + tap) into one
 - Use `scroll_to_text` instead of multiple `scroll` + `get_ui` calls
+
+## Common Mistakes (IMPORTANT)
+
+### Wrong tool names
+
+These tool names DO NOT EXIST. Use the correct names:
+
+| Wrong (will fail) | Correct |
+|---|---|
+| `tap(x, y)` | `tap_xy(x, y)` |
+| `press_key("back")` | `press_button("back")` |
+| `launch_app("com.foo")` | `start_app("com.foo")` |
+| `stop_app("com.foo")` | `stop_app("com.foo")` (this one does exist) |
+
+Note: `tap`, `press_key`, and `launch_app` are registered as aliases and will work, but prefer the canonical names above.
+
+### Wrong parameter types
+
+All `text` parameters MUST be strings, not numbers:
+
+```
+# WRONG — will cause validation error
+find_and_tap(text=98122)
+input_text(text=98122)
+
+# CORRECT
+find_and_tap(text="98122")
+input_text(text="98122")
+```
+
+### Wrong parameter names
+
+```
+# WRONG — drag uses x1/y1/x2/y2, not start_x/start_y/end_x/end_y
+drag(start_x=100, start_y=200, end_x=300, end_y=400)
+
+# CORRECT
+drag(x1=100, y1=200, x2=300, y2=400)
+```
+
+### Calling tap_element without get_ui
+
+`tap_element` now auto-refreshes the UI if the cache is empty, so this is no longer an error. But it's still faster to call `get_ui` first so you know what indices are available.
+
+### Confusing find_and_tap with tap_xy
+
+```
+# WRONG — find_and_tap takes TEXT, not coordinates
+find_and_tap(x=540, y=700)
+
+# CORRECT — use tap_xy for coordinates
+tap_xy(x=540, y=700)
+
+# CORRECT — use find_and_tap for text
+find_and_tap(text="Order here")
+```
+
+### Looping on the same failing strategy
+
+If an action fails 3+ times with the same approach, try a different strategy:
+1. Use `screenshot_small()` to visually check what's on screen
+2. Try `press_button("back")` and approach from a different screen
+3. Use `stop_app` + `start_app` to restart the app
+4. Try `open_url` with a deep link instead of navigating through menus

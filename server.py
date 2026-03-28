@@ -139,6 +139,27 @@ def _count_app_elements(ui: UIState) -> int:
     return count
 
 
+def _resize_png_safe(png_bytes: bytes, max_dim: int) -> Tuple[bytes, str]:
+    """Resize a PNG to JPEG. Returns (bytes, format).
+
+    Falls back to raw PNG if Pillow fails.
+    """
+    try:
+        from PIL import Image as PILImage
+
+        img = PILImage.open(io.BytesIO(png_bytes))
+        w, h = img.size
+        if max(w, h) > max_dim:
+            scale = max_dim / max(w, h)
+            img = img.resize((int(w * scale), int(h * scale)), PILImage.LANCZOS)
+        buf = io.BytesIO()
+        img.convert("RGB").save(buf, format="JPEG", quality=60)
+        return buf.getvalue(), "jpeg"
+    except Exception as e:
+        logger.warning(f"Pillow resize failed ({e}), returning raw PNG")
+        return png_bytes, "png"
+
+
 # ---------------------------------------------------------------------------
 # Lazy-connecting device state (survives MCP server startup without a phone)
 # ---------------------------------------------------------------------------
@@ -220,12 +241,17 @@ class DeviceState:
             # Auto-attach a screenshot for visual fallback
             try:
                 png_bytes = await self.driver.screenshot()
-                jpeg_bytes = _resize_png(png_bytes, _SCREENSHOT_MAX_DIM)
+                img_bytes, fmt = _resize_png_safe(png_bytes, _SCREENSHOT_MAX_DIM)
                 compact += "\n\n(!) Few UI elements detected — auto-attaching screenshot"
-                return [compact, Image(data=jpeg_bytes, format="jpeg")]
+                return [compact, Image(data=img_bytes, format=fmt)]
             except Exception:
                 compact += "\n\n(!) Few UI elements detected — screenshot failed"
         return compact
+
+    async def ensure_ui(self) -> None:
+        """Ensure UI cache is populated. Auto-refresh if stale/None."""
+        if self.ui is None:
+            await self.refresh_ui()
 
     async def smart_settle(self) -> None:
         """Wait for UI to stabilize after an action.
@@ -288,7 +314,10 @@ mcp = FastMCP(
         "full element details like classNames and resourceIds. "
         "Use find_and_tap to tap elements by text when you don't have the index. "
         "Use scroll_to_text to scroll until specific text appears on screen. "
-        "Prefer screenshot_small over screenshot to save context window space."
+        "Prefer screenshot_small over screenshot to save context window space. "
+        "IMPORTANT: Do NOT call nonexistent tools. The correct tool names are: "
+        "tap_xy (NOT 'tap'), press_button (NOT 'press_key'), start_app (NOT 'launch_app'). "
+        "All text parameters must be strings, not numbers (use '98122' not 98122)."
     ),
     lifespan=device_lifespan,
 )
@@ -318,20 +347,6 @@ def _action_result(prefix: str, ui_result) -> str | list:
         rest = ui_result[1:] if len(ui_result) > 1 else []
         return [f"{prefix}\n\n{text_part}"] + rest
     return f"{prefix}\n\n{ui_result}"
-
-
-def _resize_png(png_bytes: bytes, max_dim: int) -> bytes:
-    """Resize a PNG image so its longest side is at most max_dim. Returns JPEG."""
-    from PIL import Image as PILImage
-
-    img = PILImage.open(io.BytesIO(png_bytes))
-    w, h = img.size
-    if max(w, h) > max_dim:
-        scale = max_dim / max(w, h)
-        img = img.resize((int(w * scale), int(h * scale)), PILImage.LANCZOS)
-    buf = io.BytesIO()
-    img.convert("RGB").save(buf, format="JPEG", quality=60)
-    return buf.getvalue()
 
 
 # ---------------------------------------------------------------------------
@@ -365,8 +380,8 @@ async def tap_element(index: int, ctx: Context, use_clear_point: bool = False) -
             elements (useful for crowded UIs like lists with favorite buttons).
     """
     state = await _ensure_connected(ctx)
-    if state.ui is None:
-        return "Error: call get_ui first to load the UI tree."
+    # Auto-refresh UI if cache is empty (fixes "call get_ui first" errors)
+    await state.ensure_ui()
     try:
         if use_clear_point:
             x, y = state.ui.get_clear_point(index)
@@ -392,6 +407,18 @@ async def tap_xy(x: int, y: int, ctx: Context) -> str:
     await state.smart_settle()
     ui_text = await state.refresh_ui_compact()
     return _action_result(f"Tapped ({x}, {y})", ui_text)
+
+
+# Alias: models often hallucinate "tap" instead of "tap_xy"
+@mcp.tool()
+async def tap(x: int, y: int, ctx: Context) -> str:
+    """Alias for tap_xy. Tap at exact screen coordinates (pixels).
+
+    NOTE: Prefer tap_element(index) when you have an element index,
+    or find_and_tap(text) when you know the text. Use this only
+    when you need to tap specific pixel coordinates.
+    """
+    return await tap_xy(x, y, ctx)
 
 
 @mcp.tool()
@@ -423,8 +450,7 @@ async def long_press_element(
         duration_ms: How long to hold (default 1000ms).
     """
     state = await _ensure_connected(ctx)
-    if state.ui is None:
-        return "Error: call get_ui first to load the UI tree."
+    await state.ensure_ui()
     try:
         x, y = state.ui.get_element_coords(index)
         info = state.ui.get_element_info(index)
@@ -451,6 +477,9 @@ async def find_and_tap(
         text: Text to search for (case-insensitive substring match).
         occurrence: Which match to tap if multiple found (1 = first, 2 = second, etc.).
     """
+    # Type coercion: models often pass int instead of str
+    text = str(text)
+
     state = await _ensure_connected(ctx)
     # Refresh UI to get latest state
     await state.refresh_ui()
@@ -500,6 +529,7 @@ async def scroll_to_text(
 
     Returns the UI tree when found, or an error if not found.
     """
+    text = str(text)
     state = await _ensure_connected(ctx)
     pattern = re.compile(re.escape(text), re.IGNORECASE)
 
@@ -590,8 +620,7 @@ async def scroll_element(
         amount: 1-5 (small to large scroll distance). Default 3.
     """
     state = await _ensure_connected(ctx)
-    if state.ui is None:
-        return "Error: call get_ui first to load the UI tree."
+    await state.ensure_ui()
 
     try:
         elem = state.ui.get_element(index)
@@ -655,6 +684,9 @@ async def input_text(text: str, clear: bool = False, ctx: Context = None) -> str
     Set clear=True to clear existing text before typing.
     Automatically returns the updated UI tree after typing.
     """
+    # Type coercion: models often pass int instead of str
+    text = str(text)
+
     state = await _ensure_connected(ctx)
     success = await state.driver.input_text(text, clear)
     if not success:
@@ -672,7 +704,7 @@ async def press_button(button: str, ctx: Context = None) -> str:
     Supported buttons: back, home, enter
     Automatically returns the updated UI tree after pressing.
     """
-    button = button.lower()
+    button = str(button).lower()
     if button not in ("back", "home", "enter"):
         return f"Error: unknown button '{button}'. Use: back, home, enter"
     state = await _ensure_connected(ctx)
@@ -680,6 +712,13 @@ async def press_button(button: str, ctx: Context = None) -> str:
     await state.smart_settle()
     ui_text = await state.refresh_ui_compact()
     return _action_result(f"Pressed {button}", ui_text)
+
+
+# Alias: models often hallucinate "press_key" instead of "press_button"
+@mcp.tool()
+async def press_key(button: str, ctx: Context = None) -> str:
+    """Alias for press_button. Press a system button (back, home, enter)."""
+    return await press_button(button, ctx)
 
 
 @mcp.tool()
@@ -706,8 +745,8 @@ async def screenshot_small(ctx: Context) -> Image:
     """
     state = await _ensure_connected(ctx)
     png_bytes = await state.driver.screenshot()
-    jpeg_bytes = _resize_png(png_bytes, _SCREENSHOT_MAX_DIM)
-    return Image(data=jpeg_bytes, format="jpeg")
+    img_bytes, fmt = _resize_png_safe(png_bytes, _SCREENSHOT_MAX_DIM)
+    return Image(data=img_bytes, format=fmt)
 
 
 @mcp.tool()
@@ -737,6 +776,26 @@ async def start_app(package: str, ctx: Context = None) -> str:
     return _action_result(result or f"Started {package}", ui_text)
 
 
+# Alias: models often hallucinate "launch_app" instead of "start_app"
+@mcp.tool()
+async def launch_app(package: str, ctx: Context = None) -> str:
+    """Alias for start_app. Launch an app by its package name."""
+    return await start_app(package, ctx)
+
+
+@mcp.tool()
+async def stop_app(package: str, ctx: Context = None) -> str:
+    """Force stop an app by its package name.
+
+    Useful for restarting a misbehaving app. Call start_app afterwards to relaunch.
+    """
+    state = await _ensure_connected(ctx)
+    await state.driver.device.shell(f"am force-stop {package}")
+    await asyncio.sleep(0.5)
+    ui_text = await state.refresh_ui_compact()
+    return _action_result(f"Stopped {package}", ui_text)
+
+
 @mcp.tool()
 async def get_element_info(index: int, ctx: Context = None) -> str:
     """Get detailed info about a UI element by index (from cached get_ui).
@@ -745,8 +804,7 @@ async def get_element_info(index: int, ctx: Context = None) -> str:
     Does NOT re-fetch the UI tree - uses the last get_ui snapshot.
     """
     state = await _ensure_connected(ctx)
-    if state.ui is None:
-        return "Error: call get_ui first to load the UI tree."
+    await state.ensure_ui()
     info = state.ui.get_element_info(index)
     if not info:
         return f"Error: no element found with index {index}"
@@ -763,6 +821,7 @@ async def find_text(text: str, ctx: Context = None) -> str:
     Args:
         text: Text to search for (case-insensitive substring match).
     """
+    text = str(text)
     state = await _ensure_connected(ctx)
     await state.refresh_ui()
     if state.ui is None:
@@ -840,6 +899,7 @@ async def wait_for(
         timeout_s: Maximum time to wait in seconds (default 10).
         poll_interval_s: How often to check in seconds (default 1).
     """
+    text = str(text)
     state = await _ensure_connected(ctx)
     pattern = re.compile(re.escape(text), re.IGNORECASE)
     elapsed = 0.0
