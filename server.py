@@ -36,55 +36,75 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Lifespan state shared across all tool invocations
+# Lazy-connecting device state (survives MCP server startup without a phone)
 # ---------------------------------------------------------------------------
 
 
 @dataclass
 class DeviceState:
-    driver: AndroidDriver
-    state_provider: AndroidStateProvider
+    _driver: Optional[AndroidDriver] = field(default=None, repr=False)
+    _provider: Optional[AndroidStateProvider] = field(default=None, repr=False)
     ui: Optional[UIState] = field(default=None, repr=False)
+    _connected: bool = False
 
+    async def connect(self) -> None:
+        if self._connected:
+            return
 
-@asynccontextmanager
-async def device_lifespan(server: FastMCP) -> AsyncIterator[DeviceState]:
-    """Connect to the Android device on startup, tear down on shutdown."""
-    serial = os.environ.get("PIXELPAL_SERIAL", os.environ.get("DROIDRUN_SERIAL"))
-    use_tcp_env = os.environ.get("PIXELPAL_TCP", os.environ.get("DROIDRUN_TCP", ""))
-    use_tcp = use_tcp_env.lower() in ("1", "true") if use_tcp_env else False
+        serial = os.environ.get("PIXELPAL_SERIAL", os.environ.get("DROIDRUN_SERIAL"))
+        use_tcp_env = os.environ.get("PIXELPAL_TCP", os.environ.get("DROIDRUN_TCP", ""))
+        use_tcp = use_tcp_env.lower() in ("1", "true") if use_tcp_env else False
 
-    # Auto-detect device if serial not specified
-    if serial is None:
-        devices = await adb.list()
-        if not devices:
-            raise RuntimeError("No connected Android devices found.")
-        serial = devices[0].serial
+        if serial is None:
+            devices = await adb.list()
+            if not devices:
+                raise RuntimeError(
+                    "No connected Android devices found. "
+                    "Plug in your phone and enable USB debugging."
+                )
+            serial = devices[0].serial
 
-    # Ensure Portal companion app is ready
-    device_obj = await adb.device(serial=serial)
-    await ensure_portal_ready(device_obj, debug=False)
+        device_obj = await adb.device(serial=serial)
+        await ensure_portal_ready(device_obj, debug=False)
 
-    driver = AndroidDriver(serial=serial, use_tcp=use_tcp)
-    await driver.connect()
+        self._driver = AndroidDriver(serial=serial, use_tcp=use_tcp)
+        await self._driver.connect()
 
-    provider = AndroidStateProvider(
-        driver,
-        tree_filter=ConciseFilter(),
-        tree_formatter=IndexedFormatter(),
-    )
+        self._provider = AndroidStateProvider(
+            self._driver,
+            tree_filter=ConciseFilter(),
+            tree_formatter=IndexedFormatter(),
+        )
+        self._connected = True
 
-    try:
-        yield DeviceState(driver=driver, state_provider=provider)
-    finally:
-        # Disable DroidRun keyboard on shutdown
-        if driver.device:
+    @property
+    def driver(self) -> AndroidDriver:
+        assert self._driver is not None, "Not connected — call connect() first"
+        return self._driver
+
+    @property
+    def state_provider(self) -> AndroidStateProvider:
+        assert self._provider is not None, "Not connected — call connect() first"
+        return self._provider
+
+    async def shutdown(self) -> None:
+        if self._driver and self._driver.device:
             try:
-                await driver.device.shell(
+                await self._driver.device.shell(
                     "ime disable com.droidrun.portal/.input.DroidrunKeyboardIME"
                 )
             except Exception:
                 pass
+
+
+@asynccontextmanager
+async def device_lifespan(server: FastMCP) -> AsyncIterator[DeviceState]:
+    """Yield a DeviceState that lazy-connects on first tool call."""
+    state = DeviceState()
+    try:
+        yield state
+    finally:
+        await state.shutdown()
 
 
 # ---------------------------------------------------------------------------
@@ -108,6 +128,13 @@ def _get_state(ctx: Context) -> DeviceState:
     return ctx.request_context.lifespan_context
 
 
+async def _ensure_connected(ctx: Context) -> DeviceState:
+    """Get state and ensure device is connected (lazy init)."""
+    state = _get_state(ctx)
+    await state.connect()
+    return state
+
+
 # ---------------------------------------------------------------------------
 # Tools
 # ---------------------------------------------------------------------------
@@ -122,9 +149,9 @@ async def get_ui(ctx: Context) -> str:
     Use the element indices with tap_element to interact.
     Also returns phone state (current app, keyboard visibility, etc.).
     """
-    state = _get_state(ctx)
+    state = await _ensure_connected(ctx)
     ui = await state.state_provider.get_state()
-    state.ui = ui  # cache for tap_element / get_element_info
+    state.ui = ui
 
     result = ui.formatted_text
     if ui.phone_state:
@@ -139,7 +166,7 @@ async def tap_element(index: int, ctx: Context) -> str:
     Call get_ui first to see available elements and their indices.
     The tap will land at the centre of the element's bounds.
     """
-    state = _get_state(ctx)
+    state = await _ensure_connected(ctx)
     if state.ui is None:
         return "Error: call get_ui first to load the UI tree."
     try:
@@ -156,7 +183,7 @@ async def tap_element(index: int, ctx: Context) -> str:
 @mcp.tool()
 async def tap_xy(x: int, y: int, ctx: Context) -> str:
     """Tap at exact screen coordinates (pixels)."""
-    state = _get_state(ctx)
+    state = await _ensure_connected(ctx)
     await state.driver.tap(x, y)
     return f"Tapped ({x}, {y})"
 
@@ -172,7 +199,7 @@ async def swipe(
     - Scroll up: swipe(540, 500, 540, 1500)
     - Swipe left: swipe(900, 1200, 100, 1200)
     """
-    state = _get_state(ctx)
+    state = await _ensure_connected(ctx)
     await state.driver.swipe(x1, y1, x2, y2, duration_ms=duration_ms)
     return f"Swiped ({x1},{y1}) -> ({x2},{y2}) over {duration_ms}ms"
 
@@ -184,7 +211,7 @@ async def input_text(text: str, clear: bool = False, ctx: Context = None) -> str
     Use tap_element to focus an input field first, then call this.
     Set clear=True to clear existing text before typing.
     """
-    state = _get_state(ctx)
+    state = await _ensure_connected(ctx)
     success = await state.driver.input_text(text, clear)
     if success:
         return f"Typed: '{text}'" + (" (cleared first)" if clear else "")
@@ -200,7 +227,7 @@ async def press_button(button: str, ctx: Context = None) -> str:
     button = button.lower()
     if button not in ("back", "home", "enter"):
         return f"Error: unknown button '{button}'. Use: back, home, enter"
-    state = _get_state(ctx)
+    state = await _ensure_connected(ctx)
     await state.driver.press_button(button)
     return f"Pressed {button}"
 
@@ -210,9 +237,9 @@ async def screenshot(ctx: Context) -> Image:
     """Take a screenshot of the phone screen.
 
     Returns a PNG image. Prefer get_ui for structured information;
-    use screenshot only when you need to visually verify something.
+    use screenshot only when you need to visually inspect the screen.
     """
-    state = _get_state(ctx)
+    state = await _ensure_connected(ctx)
     png_bytes = await state.driver.screenshot()
     return Image(data=png_bytes, format="png")
 
@@ -224,7 +251,7 @@ async def get_apps(include_system: bool = False, ctx: Context = None) -> str:
     Returns JSON array of {package, label} for each app.
     Use the package name with start_app to launch an app.
     """
-    state = _get_state(ctx)
+    state = await _ensure_connected(ctx)
     apps = await state.driver.get_apps(include_system=include_system)
     return json.dumps(apps, indent=2)
 
@@ -236,7 +263,7 @@ async def start_app(package: str, ctx: Context = None) -> str:
     Call get_apps first to find the package name of the app you want.
     Example: start_app("com.google.android.apps.maps")
     """
-    state = _get_state(ctx)
+    state = await _ensure_connected(ctx)
     result = await state.driver.start_app(package)
     return result or f"Started {package}"
 
@@ -248,7 +275,7 @@ async def get_element_info(index: int, ctx: Context = None) -> str:
     Returns JSON with text, className, type, and child texts.
     Does NOT re-fetch the UI tree - uses the last get_ui snapshot.
     """
-    state = _get_state(ctx)
+    state = await _ensure_connected(ctx)
     if state.ui is None:
         return "Error: call get_ui first to load the UI tree."
     info = state.ui.get_element_info(index)
