@@ -320,7 +320,10 @@ mcp = FastMCP(
         "All text parameters must be strings, not numbers (use '98122' not 98122). "
         "For start_app/stop_app/launch_app, use 'package' not 'package_name' — "
         "though both are accepted. "
-        "To switch apps stuck in foreground: press_button('home') first, then stop_app, then start_app."
+        "To switch apps stuck in foreground: press_button('home') first, then stop_app, then start_app. "
+        "In messaging apps (Messenger, WhatsApp, iMessage), Enter does NOT send — "
+        "use input_text() then send_current_input() to send messages. "
+        "ALWAYS verify writes (sent messages, submitted forms) via get_ui before declaring success."
     ),
     lifespan=device_lifespan,
 )
@@ -686,6 +689,11 @@ async def input_text(text: str, clear: bool = False, ctx: Context = None) -> str
     Use tap_element to focus an input field first, then call this.
     Set clear=True to clear existing text before typing.
     Automatically returns the updated UI tree after typing.
+
+    ⚠️  WARNING — messaging apps (Messenger, WhatsApp, iMessage, Instagram DMs):
+    pressing Enter does NOT send the message — it only adds a newline.
+    After typing, call send_current_input() to find and tap the Send button,
+    then verify the message appears in the chat via get_ui before declaring success.
     """
     # Type coercion: models often pass int instead of str
     text = str(text)
@@ -698,6 +706,107 @@ async def input_text(text: str, clear: bool = False, ctx: Context = None) -> str
     ui_text = await state.refresh_ui_compact()
     label = f"Typed: '{text}'" + (" (cleared first)" if clear else "")
     return _action_result(label, ui_text)
+
+
+@mcp.tool()
+async def send_current_input(ctx: Context, verify_text: Optional[str] = None) -> str:
+    """Find and tap the Send button after typing a message. Then verify it was sent.
+
+    Use this after input_text() in any messaging app (Messenger, WhatsApp,
+    iMessage, Instagram DMs, etc.) where pressing Enter adds a newline instead
+    of sending. This tool:
+      1. Searches the current UI for common Send button patterns
+      2. Taps the first match
+      3. Waits for the UI to settle
+      4. Verifies the message was sent (optional: check for verify_text in chat)
+
+    Args:
+        verify_text: Optional snippet of the message you just typed. If provided,
+            the tool checks the post-send UI for this text to confirm delivery.
+            If absent, the tool still taps Send but skips text verification.
+
+    Returns a success/failure message plus the updated compact UI.
+    """
+    state = await _ensure_connected(ctx)
+    await state.ensure_ui()
+
+    # Common send button patterns across messaging apps, ordered by specificity
+    SEND_PATTERNS = [
+        # Resource ID patterns (most reliable)
+        "send_button", "btn_send", "action_send", "send",
+        # Text patterns
+        "Send", "send",
+        # Content description patterns (accessibility labels)
+        "Send Message", "Send message",
+    ]
+
+    # Search current UI elements for send button candidates
+    all_elems = UIState._collect_all(state.ui.elements)
+    send_elem = None
+
+    for elem in all_elems:
+        rid = elem.get("resourceId", "").lower()
+        text = elem.get("text", "").lower()
+        desc = elem.get("contentDescription", "").lower()
+
+        for pattern in SEND_PATTERNS:
+            p = pattern.lower()
+            if p in rid or text == p or p in desc:
+                # Prefer clickable elements
+                if elem.get("clickable") or elem.get("enabled"):
+                    send_elem = elem
+                    break
+        if send_elem:
+            break
+
+    if send_elem is None:
+        # Fallback: look for any small clickable element to the right of center
+        # (send buttons are typically right-aligned in chat UIs)
+        w = state.ui.screen_width if state.ui else 1080
+        candidates = [
+            e for e in all_elems
+            if e.get("clickable")
+            and _elem_center(e) is not None
+            and _elem_center(e)[0] > w * 0.7  # right 30% of screen
+        ]
+        if candidates:
+            # Pick the bottom-most right-aligned clickable element
+            send_elem = max(candidates, key=lambda e: _elem_center(e)[1])
+
+    if send_elem is None:
+        return (
+            "Could not find a Send button in the current UI. "
+            "Try tap_xy on the send button coordinates from a screenshot, "
+            "or use find_and_tap('Send')."
+        )
+
+    center = _elem_center(send_elem)
+    if center is None:
+        return "Found a Send button candidate but could not get its coordinates."
+
+    x, y = center
+    rid = send_elem.get("resourceId", "")
+    label = send_elem.get("contentDescription", send_elem.get("text", rid or "button"))
+
+    await state.driver.tap(x, y)
+    await state.smart_settle()
+    ui_text = await state.refresh_ui_compact()
+
+    # Optional verification: check if verify_text appears in the refreshed UI
+    if verify_text:
+        verify_text = str(verify_text)
+        pattern = re.compile(re.escape(verify_text), re.IGNORECASE)
+        if state.ui and _search_elements(state.ui.elements, pattern):
+            result = f"✓ Sent and verified — '{verify_text}' appears in chat (tapped '{label}' at {x},{y})"
+        else:
+            result = (
+                f"⚠ Tapped Send ('{label}' at {x},{y}) but '{verify_text}' not found in UI. "
+                f"The message may not have sent — check with get_ui or screenshot_small."
+            )
+    else:
+        result = f"Tapped Send button ('{label}' at {x},{y}) — verify with get_ui that message appears in chat"
+
+    return _action_result(result, ui_text)
 
 
 @mcp.tool()
