@@ -91,19 +91,52 @@ def _elem_center(elem: Dict[str, Any]) -> Optional[Tuple[int, int]]:
     return (left + right) // 2, (top + bottom) // 2
 
 
+def _is_noise_text(text: str) -> bool:
+    """Return True if text is just a class name, resource ID, or other noise."""
+    if not text:
+        return True
+    # Android/Java class names
+    if text.startswith(("android.", "androidx.", "com.")) and ("." in text[4:]):
+        return True
+    # Resource IDs
+    if ":id/" in text:
+        return True
+    return False
+
+
 def _format_compact(ui: UIState) -> str:
-    """Format UIState as a compact list: [index] 'text' (bounds)."""
-    lines = []
+    """Format UIState as a compact list, deduped by bounds.
+
+    Filters out class names, resource IDs, and wrapper elements.
+    When multiple elements share the same bounds, keeps only the one
+    with the longest meaningful text (the leaf with real content).
+    """
     all_elems = UIState._collect_all(ui.elements)
+
+    # Group by bounds, keeping only elements with real text
+    by_bounds: dict[str, list[tuple[int, str]]] = {}
     for elem in all_elems:
         idx = elem.get("index")
         if idx is None:
             continue
         text = elem.get("text", "")
-        if not text:
+        if _is_noise_text(text):
             continue
         bounds = elem.get("bounds", "")
-        lines.append(f"[{idx}] '{text}' ({bounds})")
+        key = bounds or str(idx)
+        by_bounds.setdefault(key, []).append((idx, text))
+
+    # For each bounds group, pick the entry with the longest text
+    # Truncate very long text to save tokens (150 chars keeps enough context)
+    lines = []
+    for bounds_key, entries in by_bounds.items():
+        idx, text = max(entries, key=lambda e: len(e[1]))
+        if len(text) > 150:
+            text = text[:147] + "..."
+        lines.append((idx, f"[{idx}] '{text}' ({bounds_key})"))
+
+    # Sort by index for stable ordering
+    lines.sort(key=lambda x: x[0])
 
     header = ""
     if ui.phone_state:
@@ -111,7 +144,75 @@ def _format_compact(ui: UIState) -> str:
         kb = "KB:visible" if ui.phone_state.get("keyboardVisible") else "KB:hidden"
         header = f"App: {app} | {kb}\n"
 
-    return header + "\n".join(lines) if lines else header + "(no text elements)"
+    result = [l[1] for l in lines]
+    return header + "\n".join(result) if result else header + "(no text elements)"
+
+
+_GENERIC_LABELS = {
+    "back", "home", "menu", "search", "close", "cancel", "ok", "done",
+    "send a like", "open camera.", "open photo gallery.", "open audio recorder.",
+    "open sticker, emoji and gif keyboard.", "message", "tap to send",
+    "chat profile", "view buyer profile", "marketplace listing",
+    "tap to refresh", "send", "profile picture",
+}
+
+
+def _summarize_ui(ui: UIState, max_items: int = 6, max_len: int = 250) -> str:
+    """Generate a 1-2 line breadcrumb summary of the current screen.
+
+    Extracts the most informative text elements: messages with content,
+    prices, names, statuses — anything an agent might need to recall later.
+    Skips generic UI labels (Back, Menu, Send) and deduplicates by content.
+    """
+    all_elems = UIState._collect_all(ui.elements)
+
+    # Collect meaningful text, deduped by bounds AND content
+    seen_bounds: set[str] = set()
+    seen_text: set[str] = set()
+    items: list[str] = []
+    for elem in all_elems:
+        text = elem.get("text", "")
+        if _is_noise_text(text):
+            continue
+        bounds = elem.get("bounds", "")
+        if bounds in seen_bounds:
+            continue
+        seen_bounds.add(bounds)
+        # Skip very short or generic labels
+        if len(text) < 4 or text.lower().strip() in _GENERIC_LABELS:
+            continue
+        # Skip if a longer item already contains this text (substring dedup)
+        text_lower = text.lower()
+        if any(text_lower in s for s in seen_text):
+            continue
+        # Remove items that are substrings of this new text
+        seen_text = {s for s in seen_text if s not in text_lower}
+        seen_text.add(text_lower)
+        # Truncate individual items
+        if len(text) > 80:
+            text = text[:77] + "..."
+        items.append(text)
+
+    if not items:
+        return "(empty screen)"
+
+    # Build the app context
+    app = ""
+    if ui.phone_state:
+        app = ui.phone_state.get("currentApp", "")
+
+    # Take the top N items, join with semicolons
+    summary_items = items[:max_items]
+    summary = "; ".join(summary_items)
+    if len(items) > max_items:
+        summary += f" (+{len(items) - max_items} more)"
+
+    # Cap total length
+    if len(summary) > max_len:
+        summary = summary[:max_len - 3] + "..."
+
+    prefix = f"[{app}] " if app else ""
+    return prefix + summary
 
 
 def _count_app_elements(ui: UIState) -> int:
@@ -390,18 +491,30 @@ async def _ensure_connected(ctx: Context) -> DeviceState:
     return state
 
 
-def _action_result(prefix: str, ui_result) -> str | list:
-    """Combine an action prefix message with the compact UI result.
+def _action_result(prefix: str, ui_result, state: "DeviceState" = None) -> str | list:
+    """Combine an action prefix, breadcrumb summary, and compact UI result.
 
-    If ui_result is a list (text + screenshot fallback), returns a list
-    with the prefix prepended to the text portion. Otherwise returns a string.
+    Output format:
+        {action_line}
+        BREADCRUMB: {short semantic summary of current screen}
+
+        {full compact UI tree}
+
+    The BREADCRUMB line is designed for the context-trim plugin: when the
+    tool result is persisted to the transcript, the plugin keeps everything
+    up to and including BREADCRUMB, and drops the full UI below.
+    This gives future turns a useful summary without the full tree.
     """
+    breadcrumb = ""
+    if state and state.ui:
+        breadcrumb = f"\nBREADCRUMB: {_summarize_ui(state.ui)}"
+
     if isinstance(ui_result, list):
         # ui_result is [compact_text, Image(...)]
         text_part = ui_result[0] if ui_result else ""
         rest = ui_result[1:] if len(ui_result) > 1 else []
-        return [f"{prefix}\n\n{text_part}"] + rest
-    return f"{prefix}\n\n{ui_result}"
+        return [f"{prefix}{breadcrumb}\n\n{text_part}"] + rest
+    return f"{prefix}{breadcrumb}\n\n{ui_result}"
 
 
 # ---------------------------------------------------------------------------
@@ -460,7 +573,7 @@ async def tap_element(
         await state.driver.tap(x, y)
         await state.smart_settle()
         ui_text = await state.refresh_ui_compact()
-        return _action_result(f"Tapped '{text}' at ({x}, {y})", ui_text)
+        return _action_result(f"Tapped '{text}' at ({x}, {y})", ui_text, state)
     except (ValueError, IndexError) as e:
         return f"Error: {e}"
 
@@ -496,7 +609,7 @@ async def tap_xy(
     await state.driver.tap(x, y)
     await state.smart_settle()
     ui_text = await state.refresh_ui_compact()
-    return _action_result(f"Tapped ({x}, {y})", ui_text)
+    return _action_result(f"Tapped ({x}, {y})", ui_text, state)
 
 
 # Alias: models often hallucinate "tap" instead of "tap_xy"
@@ -526,7 +639,7 @@ async def long_press(
     await state.long_press(x, y, duration_ms)
     await state.smart_settle()
     ui_text = await state.refresh_ui_compact()
-    return _action_result(f"Long pressed ({x}, {y}) for {duration_ms}ms", ui_text)
+    return _action_result(f"Long pressed ({x}, {y}) for {duration_ms}ms", ui_text, state)
 
 
 @mcp.tool()
@@ -548,7 +661,7 @@ async def long_press_element(
         await state.long_press(x, y, duration_ms)
         await state.smart_settle()
         ui_text = await state.refresh_ui_compact()
-        return _action_result(f"Long pressed '{text}' at ({x}, {y}) for {duration_ms}ms", ui_text)
+        return _action_result(f"Long pressed '{text}' at ({x}, {y}) for {duration_ms}ms", ui_text, state)
     except (ValueError, IndexError) as e:
         return f"Error: {e}"
 
@@ -602,7 +715,7 @@ async def find_and_tap(
     await state.driver.tap(x, y)
     await state.smart_settle()
     ui_text = await state.refresh_ui_compact()
-    return _action_result(f"Found and tapped '{matched_text}' at ({x}, {y})", ui_text)
+    return _action_result(f"Found and tapped '{matched_text}' at ({x}, {y})", ui_text, state)
 
 
 @mcp.tool()
@@ -694,7 +807,7 @@ async def scroll(
     await state.driver.swipe(x1, y1, x2, y2, duration_ms=800)
     await state.smart_settle()
     ui_text = await state.refresh_ui_compact()
-    return _action_result(f"Scrolled {direction} (amount={amount})", ui_text)
+    return _action_result(f"Scrolled {direction} (amount={amount})", ui_text, state)
 
 
 @mcp.tool()
@@ -751,7 +864,7 @@ async def scroll_element(
         await state.driver.swipe(x1, y1, x2, y2, duration_ms=600)
         await state.smart_settle()
         ui_text = await state.refresh_ui_compact()
-        return _action_result(f"Scrolled {direction} within element {index}", ui_text)
+        return _action_result(f"Scrolled {direction} within element {index}", ui_text, state)
     except (ValueError, IndexError) as e:
         return f"Error: {e}"
 
@@ -768,7 +881,7 @@ async def swipe(
     await state.driver.swipe(x1, y1, x2, y2, duration_ms=duration_ms)
     await state.smart_settle()
     ui_text = await state.refresh_ui_compact()
-    return _action_result(f"Swiped ({x1},{y1}) -> ({x2},{y2})", ui_text)
+    return _action_result(f"Swiped ({x1},{y1}) -> ({x2},{y2})", ui_text, state)
 
 
 @mcp.tool()
@@ -788,13 +901,28 @@ async def input_text(text: str, clear: bool = False, ctx: Context = None) -> str
     text = str(text)
 
     state = await _ensure_connected(ctx)
+
+    # Auto-focus: find and tap an EditText before typing.
+    # This ensures the input field is properly focused, which prevents
+    # text from disappearing when the accessibility tree is refreshed.
+    if state.ui:
+        all_elems = UIState._collect_all(state.ui.elements)
+        for elem in all_elems:
+            cls = elem.get("className", "").lower()
+            if "edittext" in cls:
+                center = _elem_center(elem)
+                if center:
+                    await state.driver.tap(center[0], center[1])
+                    await asyncio.sleep(0.5)
+                    break
+
     success = await state.driver.input_text(text, clear)
     if not success:
         return "Error: failed to type text. Is an input field focused?"
     await state.smart_settle()
     ui_text = await state.refresh_ui_compact()
     label = f"Typed: '{text}'" + (" (cleared first)" if clear else "")
-    return _action_result(label, ui_text)
+    return _action_result(label, ui_text, state)
 
 
 @mcp.tool()
@@ -817,49 +945,67 @@ async def send_current_input(ctx: Context, verify_text: Optional[str] = None) ->
     Returns a success/failure message plus the updated compact UI.
     """
     state = await _ensure_connected(ctx)
-    await state.ensure_ui()
+    # Refresh UI to get the current state — after input_text with auto-focus,
+    # the text should persist and "Send a like" should have changed to "Send"
+    await state.refresh_ui()
 
-    # Common send button patterns across messaging apps, ordered by specificity
-    SEND_PATTERNS = [
-        # Resource ID patterns (most reliable)
-        "send_button", "btn_send", "action_send", "send",
-        # Text patterns
-        "Send", "send",
-        # Content description patterns (accessibility labels)
-        "Send Message", "Send message",
-    ]
+    # SEND BUTTON DETECTION
+    # In messaging apps, the send button is typically:
+    # - "Send a like" when input is empty (tapping sends a like/thumbs up)
+    # - "Send" or a blue arrow when text is typed (tapping sends the message)
+    # Both are the SAME button at the SAME position — just different labels.
+    # Since we use cached UI (pre-input), we look for EITHER label.
+    SEND_LABELS = {"send", "send a like", "send message", "send a thumbs up"}
 
-    # Search current UI elements for send button candidates
     all_elems = UIState._collect_all(state.ui.elements)
     send_elem = None
 
+    # Strategy 1: Find element with send-like text
     for elem in all_elems:
+        text = elem.get("text", "").lower().strip()
+        desc = elem.get("contentDescription", "").lower().strip()
         rid = elem.get("resourceId", "").lower()
-        text = elem.get("text", "").lower()
-        desc = elem.get("contentDescription", "").lower()
-
-        for pattern in SEND_PATTERNS:
-            p = pattern.lower()
-            if p in rid or text == p or p in desc:
-                # Prefer clickable elements
-                if elem.get("clickable") or elem.get("enabled"):
-                    send_elem = elem
-                    break
-        if send_elem:
+        if text in SEND_LABELS or desc in SEND_LABELS:
+            send_elem = elem
+            break
+        if any(p in rid for p in ("send_button", "btn_send", "action_send")):
+            send_elem = elem
             break
 
+    # Strategy 2: Find EditText (input field), then rightmost element in same row
     if send_elem is None:
-        # Fallback: look for any small clickable element to the right of center
-        # (send buttons are typically right-aligned in chat UIs)
+        input_elem = None
+        for elem in all_elems:
+            cls = elem.get("className", "").lower()
+            if "edittext" in cls:
+                input_elem = elem
+                break
+        if input_elem:
+            input_bounds = input_elem.get("bounds", "")
+            nums = re.findall(r"\d+", input_bounds)
+            if len(nums) >= 4:
+                input_cy = (int(nums[1]) + int(nums[3])) // 2
+                right_of_input = [
+                    e for e in all_elems
+                    if _elem_center(e) is not None
+                    and _elem_center(e)[0] > int(nums[2])
+                    and abs(_elem_center(e)[1] - input_cy) < 100
+                ]
+                if right_of_input:
+                    send_elem = max(right_of_input, key=lambda e: _elem_center(e)[0])
+
+    # Strategy 3: Rightmost bottom element
+    if send_elem is None:
         w = state.ui.screen_width if state.ui else 1080
+        h = state.ui.screen_height if state.ui else 2400
         candidates = [
             e for e in all_elems
-            if e.get("clickable")
-            and _elem_center(e) is not None
-            and _elem_center(e)[0] > w * 0.7  # right 30% of screen
+            if _elem_center(e) is not None
+            and _elem_center(e)[0] > w * 0.8
+            and _elem_center(e)[1] > h * 0.85
+            and not _is_noise_text(e.get("text", ""))
         ]
         if candidates:
-            # Pick the bottom-most right-aligned clickable element
             send_elem = max(candidates, key=lambda e: _elem_center(e)[1])
 
     if send_elem is None:
@@ -895,7 +1041,7 @@ async def send_current_input(ctx: Context, verify_text: Optional[str] = None) ->
     else:
         result = f"Tapped Send button ('{label}' at {x},{y}) — verify with get_ui that message appears in chat"
 
-    return _action_result(result, ui_text)
+    return _action_result(result, ui_text, state)
 
 
 @mcp.tool()
@@ -912,7 +1058,7 @@ async def press_button(button: str, ctx: Context = None) -> str:
     await state.driver.press_button(button)
     await state.smart_settle()
     ui_text = await state.refresh_ui_compact()
-    return _action_result(f"Pressed {button}", ui_text)
+    return _action_result(f"Pressed {button}", ui_text, state)
 
 
 # Alias: models often hallucinate "press_key" instead of "press_button"
@@ -984,7 +1130,7 @@ async def start_app(
     result = await state.driver.start_app(package)
     await asyncio.sleep(2.0)  # apps take longer to launch
     ui_text = await state.refresh_ui_compact()
-    return _action_result(result or f"Started {package}", ui_text)
+    return _action_result(result or f"Started {package}", ui_text, state)
 
 
 # Alias: models often hallucinate "launch_app" instead of "start_app"
@@ -1018,7 +1164,7 @@ async def stop_app(
     await state.driver.device.shell(f"am force-stop {package}")
     await asyncio.sleep(0.5)
     ui_text = await state.refresh_ui_compact()
-    return _action_result(f"Stopped {package}", ui_text)
+    return _action_result(f"Stopped {package}", ui_text, state)
 
 
 @mcp.tool()
@@ -1085,7 +1231,7 @@ async def drag(
     )
     await state.smart_settle()
     ui_text = await state.refresh_ui_compact()
-    return _action_result(f"Dragged ({x1},{y1}) -> ({x2},{y2}) over {duration_s}s", ui_text)
+    return _action_result(f"Dragged ({x1},{y1}) -> ({x2},{y2}) over {duration_s}s", ui_text, state)
 
 
 @mcp.tool()
@@ -1104,7 +1250,7 @@ async def open_url(url: str, ctx: Context = None) -> str:
     )
     await asyncio.sleep(2.0)  # page loads take time
     ui_text = await state.refresh_ui_compact()
-    return _action_result(f"Opened: {url}", ui_text)
+    return _action_result(f"Opened: {url}", ui_text, state)
 
 
 @mcp.tool()
