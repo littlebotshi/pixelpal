@@ -1151,6 +1151,47 @@ async def wait_for(
     return f"Timeout: '{text}' not found after {timeout_s}s. Current UI:\n\n{ui_text}"
 
 
+@mcp.tool()
+async def wake_phone(ctx: Context) -> str:
+    """Wake the phone and restart the accessibility service if needed.
+
+    Call this FIRST if other tools return errors like "No active window",
+    "Portal returned error", or hang without returning.
+
+    This tool:
+    1. Wakes the screen (KEYCODE_WAKEUP)
+    2. Dismisses the lock screen (KEYCODE_MENU swipe)
+    3. Force-restarts the Portal accessibility service
+    4. Verifies the UI tree is accessible
+
+    Returns the current UI tree on success, or an error if recovery failed.
+    """
+    state = await _ensure_connected(ctx)
+    driver = state.driver
+
+    # Wake screen
+    await driver.device.shell("input keyevent KEYCODE_WAKEUP")
+    await asyncio.sleep(0.5)
+    await driver.device.shell("input keyevent KEYCODE_MENU")
+    await asyncio.sleep(1.0)
+
+    # Force restart Portal accessibility service
+    await driver.device.shell("am force-stop com.droidrun.portal")
+    await asyncio.sleep(1.0)
+    await driver.device.shell(
+        'settings put secure enabled_accessibility_services '
+        '"com.droidrun.portal/com.droidrun.portal.service.DroidrunAccessibilityService"'
+    )
+    await asyncio.sleep(3.0)
+
+    # Try to get UI tree
+    try:
+        ui_text = await state.refresh_ui()
+        return f"Phone woken and Portal restarted successfully.\n\n{ui_text}"
+    except Exception as e:
+        return f"Phone woken but UI tree fetch failed: {e}. Try again in a few seconds."
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
