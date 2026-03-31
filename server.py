@@ -1377,9 +1377,24 @@ def _extract_messages_from_ui(ui: UIState) -> List[Dict[str, Any]]:
         left, top, right = int(nums[0]), int(nums[1]), int(nums[2])
         center_x = (left + right) // 2
 
+        # Detect timestamps — universal across chat apps
+        # Patterns: "5:30 PM", "SUN AT 2:49", "Yesterday 10:10 PM", "Mar 28, 2026"
+        is_timestamp = bool(re.match(
+            r'^('
+            r'(MON|TUE|WED|THU|FRI|SAT|SUN|Mon|Tue|Wed|Thu|Fri|Sat|Sun)'  # day names
+            r'|(\d{1,2}:\d{2}\s*(AM|PM|am|pm)?)'  # time only
+            r'|(Today|Yesterday|Just now|now)'  # relative time
+            r'|(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)'  # month names
+            r'|\d{1,2}/\d{1,2}/\d{2,4}'  # date formats
+            r')',
+            text.strip()
+        ))
+
         # Infer sender from horizontal position
-        # Right side = phone owner (Ben), Left side = the other person
-        if center_x > screen_w * 0.60:
+        # Right side = phone owner, Left side = the other person
+        if is_timestamp:
+            sender = "Time"
+        elif center_x > screen_w * 0.60:
             sender = "This phone"
         elif center_x < screen_w * 0.40:
             sender = "Other"
@@ -1487,7 +1502,7 @@ async def read_conversation(
         if len(text) > 300:
             text = text[:297] + "..."
         sender = m.get("sender", "?")
-        prefix = {"This phone": "[This phone]", "Other": "[Other]", "System": "[System]"}.get(sender, "[?]")
+        prefix = {"This phone": "[This phone]", "Other": "[Other]", "Time": "[Time]", "System": "[System]"}.get(sender, "[?]")
         lines.append(f"{i}. {prefix} {text}")
 
     return f"Found {len(all_messages)} messages in conversation:\n\n" + "\n".join(lines)
