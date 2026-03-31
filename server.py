@@ -1378,10 +1378,11 @@ def _extract_messages_from_ui(ui: UIState) -> List[Dict[str, Any]]:
         center_x = (left + right) // 2
 
         # Infer sender from horizontal position
+        # Right side = phone owner (Ben), Left side = the other person
         if center_x > screen_w * 0.60:
-            sender = "You"
+            sender = "Owner"
         elif center_x < screen_w * 0.40:
-            sender = "Them"
+            sender = "Other"
         else:
             sender = "System"
 
@@ -1486,7 +1487,7 @@ async def read_conversation(
         if len(text) > 300:
             text = text[:297] + "..."
         sender = m.get("sender", "?")
-        prefix = {"You": "[You]", "Them": "[Them]", "System": "[---]"}.get(sender, "[?]")
+        prefix = {"Owner": "[Owner]", "Other": "[Other]", "System": "[System]"}.get(sender, "[?]")
         lines.append(f"{i}. {prefix} {text}")
 
     return f"Found {len(all_messages)} messages in conversation:\n\n" + "\n".join(lines)
