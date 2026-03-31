@@ -1346,12 +1346,17 @@ async def wake_phone(ctx: Context) -> str:
 def _extract_messages_from_ui(ui: UIState) -> List[Dict[str, Any]]:
     """Extract message-like elements from a chat UI.
 
-    Returns list of dicts with 'text', 'top' (y-position), and 'bounds'.
+    Returns list of dicts with 'text', 'top' (y-position), 'bounds', and 'sender'.
+    Sender is inferred from horizontal position:
+      - Right-aligned (center x > 60% of screen) → "You"
+      - Left-aligned (center x < 40% of screen) → "Them"
+      - Center → "System" (timestamps, status messages)
     Filters out UI chrome (toolbar, input fields, generic labels).
     """
     all_elems = UIState._collect_all(ui.elements)
     messages = []
     seen_text: set = set()
+    screen_w = ui.screen_width if ui else 1080
 
     for elem in all_elems:
         text = elem.get("text", "")
@@ -1369,7 +1374,16 @@ def _extract_messages_from_ui(ui: UIState) -> List[Dict[str, Any]]:
         if len(nums) < 4:
             continue
 
-        top = int(nums[1])
+        left, top, right = int(nums[0]), int(nums[1]), int(nums[2])
+        center_x = (left + right) // 2
+
+        # Infer sender from horizontal position
+        if center_x > screen_w * 0.60:
+            sender = "You"
+        elif center_x < screen_w * 0.40:
+            sender = "Them"
+        else:
+            sender = "System"
 
         # Dedup by exact text + similar position (within 20px)
         dedup_key = f"{text}:{top // 20}"
@@ -1381,6 +1395,7 @@ def _extract_messages_from_ui(ui: UIState) -> List[Dict[str, Any]]:
             "text": text,
             "top": top,
             "bounds": bounds,
+            "sender": sender,
         })
 
     # Sort by vertical position (top of screen first)
@@ -1464,13 +1479,15 @@ async def read_conversation(
     # Sort by order of discovery (top-to-bottom as scrolled)
     all_messages.sort(key=lambda m: m["order"])
 
-    # Format output
+    # Format output with sender labels
     lines = []
     for i, m in enumerate(all_messages, 1):
         text = m["text"]
         if len(text) > 300:
             text = text[:297] + "..."
-        lines.append(f"{i}. {text}")
+        sender = m.get("sender", "?")
+        prefix = {"You": "[You]", "Them": "[Them]", "System": "[---]"}.get(sender, "[?]")
+        lines.append(f"{i}. {prefix} {text}")
 
     return f"Found {len(all_messages)} messages in conversation:\n\n" + "\n".join(lines)
 
