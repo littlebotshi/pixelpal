@@ -1339,6 +1339,143 @@ async def wake_phone(ctx: Context) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Conversation reading
+# ---------------------------------------------------------------------------
+
+
+def _extract_messages_from_ui(ui: UIState) -> List[Dict[str, Any]]:
+    """Extract message-like elements from a chat UI.
+
+    Returns list of dicts with 'text', 'top' (y-position), and 'bounds'.
+    Filters out UI chrome (toolbar, input fields, generic labels).
+    """
+    all_elems = UIState._collect_all(ui.elements)
+    messages = []
+    seen_text: set = set()
+
+    for elem in all_elems:
+        text = elem.get("text", "")
+        if not text or _is_noise_text(text):
+            continue
+        # Skip generic UI labels
+        if text.lower().strip() in _GENERIC_LABELS:
+            continue
+        # Skip very short text that's likely a button
+        if len(text) <= 2 and not text[0].isdigit():
+            continue
+
+        bounds = elem.get("bounds", "")
+        nums = re.findall(r"\d+", bounds)
+        if len(nums) < 4:
+            continue
+
+        top = int(nums[1])
+
+        # Dedup by exact text + similar position (within 20px)
+        dedup_key = f"{text}:{top // 20}"
+        if dedup_key in seen_text:
+            continue
+        seen_text.add(dedup_key)
+
+        messages.append({
+            "text": text,
+            "top": top,
+            "bounds": bounds,
+        })
+
+    # Sort by vertical position (top of screen first)
+    messages.sort(key=lambda m: m["top"])
+    return messages
+
+
+@mcp.tool()
+async def read_conversation(
+    scrolls_up: int = 3,
+    scrolls_down: int = 3,
+    ctx: Context = None,
+) -> str:
+    """Read chat messages by scrolling up and down from the current position.
+
+    Must be called when already inside a chat/conversation screen.
+    Scrolls up a few screens to catch recent history, then scrolls back down
+    to the latest messages. Captures all text at each position and deduplicates.
+
+    Much faster and cheaper than reading the entire conversation — use this
+    instead of multiple get_ui + scroll combos.
+
+    Args:
+        scrolls_up: How many screens to scroll up from current position (default 3).
+        scrolls_down: How many screens to scroll back down (default 3).
+            Set higher than scrolls_up to also read below current position.
+    """
+    state = await _ensure_connected(ctx)
+
+    w = state.ui.screen_width if state.ui else 1080
+    h = state.ui.screen_height if state.ui else 2400
+    cx = w // 2
+    scroll_dist = int(h * 0.30)
+
+    all_messages: List[Dict[str, Any]] = []
+    seen_texts: set = set()
+    order_counter = 0
+
+    def _add_new_messages(msgs: List[Dict[str, Any]]) -> int:
+        nonlocal order_counter
+        new_count = 0
+        for m in msgs:
+            key = m["text"].strip()
+            if key not in seen_texts and len(key) > 2:
+                seen_texts.add(key)
+                m["order"] = order_counter
+                order_counter += 1
+                all_messages.append(m)
+                new_count += 1
+        return new_count
+
+    # Capture current position first
+    await state.refresh_ui()
+    if state.ui:
+        _add_new_messages(_extract_messages_from_ui(state.ui))
+
+    # Phase 1: Scroll UP to catch recent history
+    for i in range(scrolls_up):
+        await state.driver.swipe(cx, h // 4, cx, h // 4 + scroll_dist, duration_ms=500)
+        await asyncio.sleep(0.7)
+        await state.refresh_ui()
+        if state.ui:
+            _add_new_messages(_extract_messages_from_ui(state.ui))
+
+    # Phase 2: Scroll back DOWN past original position
+    total_down = scrolls_up + scrolls_down
+    for i in range(total_down):
+        await state.driver.swipe(cx, h // 2 + scroll_dist // 2, cx, h // 2 - scroll_dist // 2, duration_ms=500)
+        await asyncio.sleep(0.7)
+        await state.refresh_ui()
+        if state.ui:
+            curr_msgs = _extract_messages_from_ui(state.ui)
+            new_count = _add_new_messages(curr_msgs)
+            # If scrolling down past the bottom, stop early
+            if new_count == 0 and i >= scrolls_up:
+                break
+
+    if not all_messages:
+        return "No messages found. Make sure you're inside a chat conversation before calling this tool."
+
+    # Sort by order of discovery (top-to-bottom as scrolled)
+    all_messages.sort(key=lambda m: m["order"])
+
+    # Format output
+    lines = []
+    for i, m in enumerate(all_messages, 1):
+        text = m["text"]
+        if len(text) > 300:
+            text = text[:297] + "..."
+        lines.append(f"{i}. {text}")
+
+    return f"Found {len(all_messages)} messages in conversation:\n\n" + "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
