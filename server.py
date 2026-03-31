@@ -1492,6 +1492,17 @@ async def read_conversation(
     if not all_messages:
         return "No messages found. Make sure you're inside a chat conversation before calling this tool."
 
+    # Extract page header from the latest UI snapshot
+    # The header is typically the topmost meaningful text on screen
+    header = ""
+    if state.ui:
+        all_elems = UIState._collect_all(state.ui.elements)
+        for elem in sorted(all_elems, key=lambda e: int(re.findall(r"\d+", e.get("bounds", "0,9999,0,0"))[1]) if re.findall(r"\d+", e.get("bounds", "")) else 9999):
+            t = elem.get("text", "")
+            if t and not _is_noise_text(t) and t.lower().strip() not in _GENERIC_LABELS and len(t) > 3:
+                header = t
+                break
+
     # Sort by order of discovery (top-to-bottom as scrolled)
     all_messages.sort(key=lambda m: m["order"])
 
@@ -1505,7 +1516,8 @@ async def read_conversation(
         prefix = {"This phone": "[This phone]", "Other": "[Other]", "Time": "[Time]", "System": "[System]"}.get(sender, "[?]")
         lines.append(f"{i}. {prefix} {text}")
 
-    return f"Found {len(all_messages)} messages in conversation:\n\n" + "\n".join(lines)
+    header_line = f"Page: {header}\n" if header else ""
+    return f"{header_line}Found {len(all_messages)} messages in conversation:\n\n" + "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
